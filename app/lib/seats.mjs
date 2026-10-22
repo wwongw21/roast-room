@@ -125,6 +125,21 @@ export function validateCard(text, round, optionIds) {
     if (!value || value === "...") issues.push(`missing ${label}`);
     return value;
   };
+  const requireSection = (label) => {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+    const header = new RegExp(`^\\s*\\**${escaped}\\**\\s*:\\s*(.*?)\\s*$`, "i");
+    const lines = text.split(/\r?\n/);
+    const index = lines.findIndex((line) => header.test(line));
+    const inline = index >= 0 ? field(lines[index], label) : "";
+    if (inline && inline !== "...") return;
+    for (let i = index + 1; index >= 0 && i < lines.length; i += 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (/^\**(?:SEAT|I DISAGREE MOST WITH|I CONCEDE|STANCE|OPTION SCORES|PILLAR SCORE|CONFIDENCE|RUIN RISK|MOVED|MY CONDITIONS FOR YES)\**\s*:\s*/i.test(line) || line === "...") break;
+      return;
+    }
+    issues.push(`missing ${label}`);
+  };
   const numberField = (label) => {
     const value = field(text, label);
     const match = value.match(/^\s*(-?\d+(?:\.\d+)?)(?:\s*\/\s*-?\d+(?:\.\d+)?)?(?:\s|$)/);
@@ -159,7 +174,7 @@ export function validateCard(text, round, optionIds) {
     } else {
       requireText("I DISAGREE MOST WITH");
       requireText("I CONCEDE");
-      requireText("ON THE CRUXES");
+      requireSection("ON THE CRUXES");
       if (!/^(no|yes)\b/i.test(field(text, "MOVED"))) issues.push("MOVED must begin with yes or no");
     }
   } else {

@@ -85,6 +85,24 @@ test("saved sessions keep distinct IDs, retain legacy folders, and update only t
   });
 });
 
+test("round-two validation accepts multiline crux answers in existing debate cards", async () => {
+  await withAppFixture(async ({ load }) => {
+    const seats = await load("lib/seats.mjs");
+    const { splitCards } = await load("lib/watch.mjs");
+    const roundFile = path.join(sourceRoot, "sessions", "2026-10-09-example-take-the-seed", "round-2.md");
+    const cards = splitCards(fs.readFileSync(roundFile, "utf8"));
+
+    assert.equal(cards.length, 7);
+    for (const card of cards) {
+      assert.deepEqual(seats.validateCard(card.text, 2, ["A", "B", "C"]), [], `${card.key} should accept answers below ON THE CRUXES:`);
+    }
+    const emptyCruxSection = cards[0].text.replace(/^ON THE CRUXES:[\s\S]*?(?=^STANCE:)/m, "ON THE CRUXES:\n\n");
+    assert.ok(seats.validateCard(emptyCruxSection, 2, ["A", "B", "C"]).includes("missing ON THE CRUXES"), "an empty crux section should still fail");
+    const boldEmptySection = emptyCruxSection.replace("ON THE CRUXES:", "**ON THE CRUXES:**");
+    assert.ok(seats.validateCard(boldEmptySection, 2, ["A", "B", "C"]).includes("missing ON THE CRUXES"), "bold empty labels should not count as an answer");
+  });
+});
+
 test("an interrupted atomic replacement leaves the previous valid file intact", async () => {
   await withAppFixture(async ({ root, load }) => {
     const { atomicWriteFile } = await load("lib/council.mjs");
