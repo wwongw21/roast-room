@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {save,listSaved,loadSaved} from './roast-sandbox/app/lib/council.mjs';
+import {stream} from './roast-sandbox/app/lib/anthropic.mjs';
+const one={id:'2026-10-22-first',prompt:'Repeat the same decision',mode:'full',status:'done',events:[{type:'marker',n:1}],state:{}};
+const two={...one,id:'2026-10-22-second',events:[{type:'marker',n:2}]};
+save(one); save(two);
+assert.equal(listSaved().length,1);
+assert.equal(loadSaved(one.id),null);
+assert.equal(loadSaved(two.id).events[0].n,2);
+console.log('CONFIRMED: saving same prompt/title twice in one day overwrites first session; only second remains.');
+globalThis.fetch=async()=>new Response('data: '+JSON.stringify({type:'content_block_delta',delta:{type:'text_delta',text:'cut off mid card'}})+'\n\n',{status:200});
+assert.equal(await stream({model:'mock',system:'mock',messages:[]}), 'cut off mid card');
+console.log('CONFIRMED: SSE response ending before message_stop is accepted as a completed card. Mock fetch only; no external API requests.');
