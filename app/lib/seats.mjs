@@ -69,6 +69,14 @@ const field = (text, label) => {
 };
 const num = (s) => { const m = (s || "").match(/(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : null; };
 
+function parseVote(value) {
+  const vote = value.trim().replace(/[.!]+$/, "").toLowerCase();
+  if (vote === "endorse with amendment") return "amend";
+  if (vote === "endorse") return "endorse";
+  if (vote === "dissent") return "dissent";
+  return "";
+}
+
 export function parseOptionScores(text, optionIds) {
   // the option line itself uses "·" between options, so read to end of line
   const lm = text.match(/OPTION SCORES\**[ \t]*:[ \t]*([^\n]+)/i);
@@ -86,8 +94,7 @@ export function parseCard(text, optionIds) {
   const ruin = (field(text, "RUIN RISK").match(/none|possible|likely/i) || [""])[0].toLowerCase();
   const disagree = field(text, "I DISAGREE MOST WITH");
   const target = SEATS.find((s) => new RegExp(`\\b(${s.short}|${s.name.split(" ").pop()})\\b`, "i").test(disagree.slice(0, 40)));
-  const voteRaw = field(text, "VOTE");
-  const vote = /dissent/i.test(voteRaw) ? "dissent" : /amend/i.test(voteRaw) ? "amend" : /endorse/i.test(voteRaw) ? "endorse" : "";
+  const vote = parseVote(field(text, "VOTE"));
   return {
     stance,
     call: field(text, "THE CALL"),
@@ -108,4 +115,60 @@ export function parseCard(text, optionIds) {
     risk: field(text, "THE RISK I SEE"),
     thisWeek: field(text, "WHAT I'D DO THIS WEEK"),
   };
+}
+
+/** Return missing or out-of-range fields before a generated card can affect scoring. */
+export function validateCard(text, round, optionIds) {
+  const issues = [];
+  const requireText = (label) => {
+    const value = field(text, label);
+    if (!value || value === "...") issues.push(`missing ${label}`);
+    return value;
+  };
+  const numberField = (label) => {
+    const value = field(text, label);
+    const match = value.match(/^\s*(-?\d+(?:\.\d+)?)(?:\s*\/\s*-?\d+(?:\.\d+)?)?(?:\s|$)/);
+    return match ? Number(match[1]) : null;
+  };
+  const checkRange = (label, value, min = 0, max = 10) => {
+    if (value === null || !Number.isFinite(value) || value < min || value > max) {
+      issues.push(`${label} must be a number from ${min} to ${max}`);
+    }
+  };
+
+  if (![1, 2, 3].includes(round)) return [`unsupported round ${round}`];
+  const scoreLine = text.match(/^\s*OPTION SCORES\**[ \t]*:[ \t]*([^\n]+)/im)?.[1] || "";
+  for (const id of optionIds) {
+    const match = scoreLine.match(new RegExp(`\\b${id}\\b\\s*[:=]?\\s*(-?\\d+(?:\\.\\d+)?)`));
+    if (!match) issues.push(`missing score for option ${id}`);
+    else checkRange(`option ${id} score`, Number(match[1]));
+  }
+
+  if (round === 1 || round === 2) {
+    requireText("STANCE");
+    checkRange("PILLAR SCORE", numberField("PILLAR SCORE"));
+    checkRange("CONFIDENCE", numberField("CONFIDENCE"), 1, 5);
+    if (!/^(none|possible|likely)\b/i.test(field(text, "RUIN RISK"))) issues.push("RUIN RISK must be none, possible, or likely");
+    if (round === 1) {
+      requireText("THE CALL");
+      requireText("THE RISK I SEE");
+      requireText("WHAT WOULD CHANGE MY MIND");
+      requireText("WHAT I'D DO THIS WEEK");
+      requireText("QUESTION FOR THE FOUNDER");
+      if (!/^(one-way|two-way)\b/i.test(field(text, "DOOR"))) issues.push("DOOR must be one-way or two-way");
+    } else {
+      requireText("I DISAGREE MOST WITH");
+      requireText("I CONCEDE");
+      requireText("ON THE CRUXES");
+      if (!/^(no|yes)\b/i.test(field(text, "MOVED"))) issues.push("MOVED must begin with yes or no");
+    }
+  } else {
+    const vote = field(text, "VOTE");
+    if (!parseVote(vote)) issues.push("VOTE must be Endorse, Endorse with amendment, or Dissent");
+    checkRange("FINAL SCORE", numberField("FINAL SCORE"));
+    checkRange("FINAL PILLAR SCORE", numberField("FINAL PILLAR SCORE"));
+    requireText("ONE LINE FOR THE FOUNDER");
+  }
+
+  return issues;
 }

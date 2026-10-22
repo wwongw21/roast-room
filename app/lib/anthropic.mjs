@@ -22,7 +22,7 @@ function addUsage(u = {}) {
   usage.calls += 1;
 }
 
-/** Stream a message; calls onText(delta) as text arrives. Returns the full text. */
+/** Stream a message; calls onText(delta) as text arrives. Returns only complete text responses. */
 export async function stream({ model, system, messages, maxTokens = 2000, onText = () => {} }) {
   for (let attempt = 0; attempt < 6; attempt++) {
     const res = await fetch(URL, {
@@ -36,28 +36,56 @@ export async function stream({ model, system, messages, maxTokens = 2000, onText
     let buf = "";
     const dec = new TextDecoder();
     const finalUsage = {};
-    for await (const chunk of res.body) {
-      buf += dec.decode(chunk, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        if (!line.startsWith("data:")) continue;
-        let ev;
-        try { ev = JSON.parse(line.slice(5)); } catch { continue; }
-        if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-          text += ev.delta.text;
-          onText(ev.delta.text);
-        } else if (ev.type === "message_start") {
-          Object.assign(finalUsage, ev.message?.usage || {});
-        } else if (ev.type === "message_delta") {
-          Object.assign(finalUsage, ev.usage || {});
-        } else if (ev.type === "error") {
-          throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error).slice(0, 300)}`);
+    let sawMessageStart = false;
+    let sawMessageStop = false;
+    let refusalBlock = false;
+    let stopReason = null;
+    const consumeLine = (rawLine) => {
+      const line = rawLine.replace(/\r$/, "").trim();
+      if (!line.startsWith("data:")) return;
+      let ev;
+      try { ev = JSON.parse(line.slice(5).trimStart()); } catch { return; }
+      if (ev.type === "message_start") {
+        sawMessageStart = true;
+        Object.assign(finalUsage, ev.message?.usage || {});
+      } else if (ev.type === "message_delta") {
+        Object.assign(finalUsage, ev.usage || {});
+        if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
+      } else if (ev.type === "content_block_start" && ev.content_block?.type === "refusal") {
+        refusalBlock = true;
+      } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+        text += ev.delta.text;
+        onText(ev.delta.text);
+      } else if (ev.type === "message_stop") {
+        sawMessageStop = true;
+      } else if (ev.type === "error") {
+        throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error).slice(0, 300)}`);
+      }
+    };
+
+    try {
+      for await (const chunk of res.body) {
+        buf += dec.decode(chunk, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          consumeLine(buf.slice(0, i));
+          buf = buf.slice(i + 1);
         }
       }
+      buf += dec.decode();
+      if (buf) for (const line of buf.split("\n")) consumeLine(line);
+    } finally {
+      // A clean refusal or truncated stream still consumed this request's reported tokens.
+      if (sawMessageStart) addUsage(finalUsage);
     }
-    addUsage(finalUsage);
+
+    if (!sawMessageStart) throw new Error("Anthropic stream ended without message_start");
+    if (!sawMessageStop) throw new Error("Anthropic stream ended before message_stop");
+    if (refusalBlock || stopReason === "refusal") throw new Error("Anthropic refusal: the requested response was not completed");
+    if (!stopReason) throw new Error("Anthropic stream ended without a stop reason");
+    if (stopReason !== "end_turn") {
+      throw new Error(`Anthropic stream ended with unsupported stop reason: ${stopReason}`);
+    }
     return text;
   }
   throw new Error("Anthropic API kept refusing after retries");
@@ -80,6 +108,10 @@ export async function json({ model, system, prompt, schema, maxTokens = 4000 }) 
     const j = await res.json();
     addUsage(j.usage);
     if (j.stop_reason === "max_tokens") throw new Error("Chair output hit max_tokens");
+    if (j.stop_reason === "refusal") throw new Error("Chair refusal: the requested response was not completed");
+    if (j.stop_reason !== "end_turn") {
+      throw new Error(`Chair output ended with unsupported stop reason: ${j.stop_reason || "missing"}`);
+    }
     return JSON.parse(j.content.map((b) => b.text || "").join(""));
   }
   throw new Error("Anthropic API kept refusing after retries");

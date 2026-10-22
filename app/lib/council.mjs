@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { SEATS, byKey, systemFor, parseCard, checkQuotes } from "./seats.mjs";
+import { createHash, randomUUID } from "node:crypto";
+import { SEATS, byKey, systemFor, parseCard, validateCard, checkQuotes } from "./seats.mjs";
 import * as ai from "./anthropic.mjs";
 import { S } from "./anthropic.mjs";
 import { SESSIONS_DIR } from "./env.mjs";
@@ -24,7 +25,7 @@ function slugify(t) {
 }
 
 function newSession(prompt, mode) {
-  const id = `${new Date().toISOString().slice(0, 10)}-${Date.now().toString(36)}`;
+  const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID()}`;
   const s = { id, prompt, mode, status: "running", events: [], subs: new Set(), started: Date.now(), state: {} };
   sessions.set(id, s);
   return s;
@@ -305,20 +306,35 @@ async function runSeat(s, st, round, key, prompt) {
       messages: [{ role: "user", content: prompt }],
       onText: (d) => { text += d; emit(s, "delta", { round, seat: key, text: d }); },
     });
+    const issues = validateCard(text, round, st.options.map((o) => o.id));
+    if (issues.length) throw new Error(`Incomplete round ${round} card: ${issues.join("; ")}`);
+    const parsed = parseCard(text, st.options.map((o) => o.id));
+    const quotes = checkQuotes(key, text);
+    st.cards[round][key] = { text, parsed, quotes };
+    emit(s, "seat_done", { round, seat: key, text, parsed, quotes, name: seat.name });
   } catch (e) {
     emit(s, "seat_error", { round, seat: key, error: String(e.message || e) });
     throw e;
   }
-  const parsed = parseCard(text, st.options.map((o) => o.id));
-  const quotes = checkQuotes(key, text);
-  st.cards[round][key] = { text, parsed, quotes };
-  emit(s, "seat_done", { round, seat: key, text, parsed, quotes, name: seat.name });
 }
 
 async function roundAll(s, st, round, promptFn) {
   emit(s, "round_start", { round });
   // stagger starts slightly so speech bubbles open in a ripple around the table
-  await Promise.all(st.seats.map((k, i) => new Promise((r) => setTimeout(r, i * 350)).then(() => runSeat(s, st, round, k, promptFn(st, byKey[k])))));
+  let failed = false;
+  let firstError;
+  const tasks = st.seats.map((k, i) => new Promise((resolve) => setTimeout(resolve, i * 350))
+    .then(() => runSeat(s, st, round, k, promptFn(st, byKey[k])))
+    .catch((error) => {
+      if (!failed) {
+        failed = true;
+        firstError = error;
+      }
+    }));
+  // Every task catches its own error so Promise.all drains all stagger timers and seat
+  // requests before the caller can mark this council terminal.
+  await Promise.all(tasks);
+  if (failed) throw firstError;
   const scores = optionScores(st, round);
   st.scores[round] = scores;
   emit(s, "round_done", { round, scores });
@@ -329,8 +345,12 @@ export function startCouncil(prompt, mode = "full") {
   run(s).catch((e) => {
     s.status = "error";
     emit(s, "error", { error: String(e.message || e) });
+    try {
+      save(s);
+    } catch (saveError) {
+      console.error("save failed", saveError);
+    }
     for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
-    save(s);
   });
   return s;
 }
@@ -391,8 +411,8 @@ async function run(s) {
   emit(s, "verdict", { verdict: st.verdict, seats: verdictSeats(st, last) });
   s.status = "done";
   emit(s, "usage", { usage: ai.usage });
-  for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
   save(s);
+  for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
 }
 
 /** The verdict's numbers, computed from the last round's cards (shared with the folder watcher). */
@@ -409,7 +429,7 @@ export function finalNumbers(st) {
     for (const k of st.seats) { const v = st.cards[3][k]?.parsed.finalScore; if (typeof v === "number") { n += v * st.weights[k].weight; d += st.weights[k].weight; } }
     return d ? Math.round((n / d) * 10) / 10 : null;
   })() : null;
-  const votes = last === 3 ? st.seats.reduce((acc, k) => { const v = st.cards[3][k]?.parsed.vote || "endorse"; acc[v] = (acc[v] || 0) + 1; return acc; }, {}) : null;
+  const votes = last === 3 ? st.seats.reduce((acc, k) => { const v = st.cards[3][k]?.parsed.vote; if (v) acc[v] = (acc[v] || 0) + 1; return acc; }, {}) : null;
   return { last, finalScores, recommended, spreadF, confidence, support, votes };
 }
 
@@ -425,25 +445,72 @@ export function verdictSeats(st, last) {
 }
 
 // ---------------------------------------------------------------- persistence
-export function save(s) {
+export function atomicWriteFile(file, data, io = fs) {
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  let fd;
+  let created = false;
   try {
-    const st = s.state || {};
-    const dir = path.join(SESSIONS_DIR, `${s.id.slice(0, 10)}-${slugify(st.title || s.prompt)}`);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "events.json"), JSON.stringify({ id: s.id, prompt: s.prompt, mode: s.mode, status: s.status, title: st.title, events: s.events }, null, 1));
-    if (st.options) {
-      const lines = [`# ${st.title}`, "", `Asked: ${s.prompt}`, "", st.brief, "", "Options:", ...st.options.map((o) => `- ${o.id}: ${o.label}`), "", "Assumptions:", ...(st.assumptions || []).map((a) => `- ${a}`), "", "| Seat | Weight | Reason |", "|---|---|---|", ...SEATS.map((x) => `| ${x.short} | ${st.weights[x.key].weight} | ${st.weights[x.key].reason} |`)];
-      fs.writeFileSync(path.join(dir, "brief.md"), lines.join("\n") + "\n");
+    fd = io.openSync(temp, "wx");
+    created = true;
+    io.writeFileSync(fd, data, "utf8");
+    io.fsyncSync(fd);
+    io.closeSync(fd);
+    fd = undefined;
+    io.renameSync(temp, file);
+  } catch (error) {
+    if (fd !== undefined) {
+      try { io.closeSync(fd); } catch {}
     }
-    for (const r of st.rounds || []) {
-      const body = (st.seats || []).map((k) => `## ${byKey[k].name} (weight ${st.weights[k].weight})\n\n${st.cards[r][k]?.text || ""}`).join("\n\n");
-      fs.writeFileSync(path.join(dir, `round-${r}.md`), `# Round ${r}\n\n${body}\n`);
+    if (created) {
+      try { io.unlinkSync(temp); } catch {}
     }
-    if (st.verdict) fs.writeFileSync(path.join(dir, "verdict.md"), verdictMarkdown(st));
-    s.dir = dir;
-  } catch (e) {
-    console.error("save failed", e);
+    throw new Error(`Atomic write of ${path.basename(file)} failed: ${error.message}`, { cause: error });
   }
+}
+
+function sessionDirectory(s) {
+  if (typeof s.id !== "string" || !s.id) throw new Error("Cannot save a session without an ID");
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  const idPrefix = slugify(s.id).slice(0, 60);
+  const idHash = createHash("sha256").update(s.id).digest("hex");
+  const base = `${idPrefix}-${idHash}`;
+
+  for (let suffix = 0; ; suffix += 1) {
+    const name = suffix ? `${base}-${suffix + 1}` : base;
+    const dir = path.join(SESSIONS_DIR, name);
+    try {
+      fs.mkdirSync(dir);
+      return dir;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+
+    const eventsFile = path.join(dir, "events.json");
+    if (fs.existsSync(eventsFile)) {
+      try {
+        if (JSON.parse(fs.readFileSync(eventsFile, "utf8")).id === s.id) return dir;
+      } catch {
+        // An unreadable or unrelated folder is occupied; never claim it for this session.
+      }
+    }
+  }
+}
+
+export function save(s) {
+  const st = s.state || {};
+  const dir = sessionDirectory(s);
+  if (st.options) {
+    const lines = [`# ${st.title}`, "", `Asked: ${s.prompt}`, "", st.brief, "", "Options:", ...st.options.map((o) => `- ${o.id}: ${o.label}`), "", "Assumptions:", ...(st.assumptions || []).map((a) => `- ${a}`), "", "| Seat | Weight | Reason |", "|---|---|---|", ...SEATS.map((x) => `| ${x.short} | ${st.weights[x.key].weight} | ${st.weights[x.key].reason} |`)];
+    atomicWriteFile(path.join(dir, "brief.md"), lines.join("\n") + "\n");
+  }
+  for (const r of st.rounds || []) {
+    const body = (st.seats || []).map((k) => `## ${byKey[k].name} (weight ${st.weights[k].weight})\n\n${st.cards[r][k]?.text || ""}`).join("\n\n");
+    atomicWriteFile(path.join(dir, `round-${r}.md`), `# Round ${r}\n\n${body}\n`);
+  }
+  if (st.verdict) atomicWriteFile(path.join(dir, "verdict.md"), verdictMarkdown(st));
+  atomicWriteFile(path.join(dir, "events.json"), JSON.stringify({ id: s.id, prompt: s.prompt, mode: s.mode, status: s.status, title: st.title, events: s.events }, null, 1));
+  s.dir = dir;
+  return dir;
 }
 
 function verdictMarkdown(st) {
