@@ -510,8 +510,7 @@ async function onSeatDone(ev) {
     }
     sub = /^yes/i.test(parsed.moved) ? "Changed position" : "";
   } else {
-    const v = parsed.vote || "endorse";
-    tag = `Votes ${v}`;
+    tag = parsed.vote ? `Votes ${parsed.vote}` : "Vote missing";
 
   }
   feedCard(round, seat, parsed);
@@ -522,14 +521,15 @@ async function onSeatDone(ev) {
   chip.hidden = round === 3; // the vote stamp says it
   chip.className = "chip";
   if (round === 3) {
-    const v = parsed.vote || "endorse";
-    chip.textContent = v;
-    chip.classList.add(v);
     $(`#seat-${seat} .vote`)?.remove();
-    const stamp = document.createElement("div");
-    stamp.className = `vote ${v}`;
-    stamp.textContent = v.toUpperCase();
-    $(`#seat-${seat}`).appendChild(stamp);
+    if (parsed.vote) {
+      chip.textContent = parsed.vote;
+      chip.classList.add(parsed.vote);
+      const stamp = document.createElement("div");
+      stamp.className = `vote ${parsed.vote}`;
+      stamp.textContent = parsed.vote.toUpperCase();
+      $(`#seat-${seat}`).appendChild(stamp);
+    }
   } else chip.textContent = stanceWord(parsed.stance);
   if (top) { const sc = $(".score", pl); sc.hidden = false; sc.textContent = `${top.id} ${top.v}`; sc.title = `Highest score: option ${top.id}`; }
   setSpeaker(null);
@@ -612,7 +612,7 @@ function feedCard(round, seat, parsed) {
   d.dataset.round = round;
   const top = topOption(parsed.optionScores);
   const tgt = parsed.disagreeWith ? state.byKey[parsed.disagreeWith]?.short : "";
-  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : `Votes ${parsed.vote || "endorse"}`;
+  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : parsed.vote ? `Votes ${parsed.vote}` : "Vote missing";
   d.innerHTML = `<img class="av" src="${portrait(seat)}" alt=""><div><div class="h">${esc(s.short)}<span class="r">${esc(what)}</span></div><p>${esc(lineFor(round, parsed, 105))}</p></div>`;
   feedAppend(d);
 }

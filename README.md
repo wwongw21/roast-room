@@ -82,6 +82,8 @@ Run `npm start`, open http://localhost:4730, and click **Past sessions**. Three 
 
 If you'd rather type a decision straight into the room, copy `.env.example` to `.env`, add an `ANTHROPIC_API_KEY`, set `COUNCIL_RUNNER=api`, and restart `npm start`. That mode bills your Anthropic API account (about 25 calls per full council).
 
+API-runner sessions use folders named from their unique session IDs so repeated decisions cannot replace one another. The app continues to read older date-and-title folders.
+
 ## What's inside
 
 | Path | What |
